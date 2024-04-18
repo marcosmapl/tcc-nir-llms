@@ -1,5 +1,16 @@
-import numpy as np
 import json
+import numpy as np
+import os
+import pandas as pd
+import pickle
+import time
+import torch
+
+from datasets import Dataset
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from sklearn.model_selection import StratifiedKFold
+from transformers import BitsAndBytesConfig, TrainingArguments, AutoModelForCausalLM, AutoTokenizer, Trainer
+from trl import SFTTrainer
 
 PROMPT_TEMPLATE1 = """You are a movie expert provide the answer for the question based on the given context. If you don't know the answer to a question, please don't share false information.
 
@@ -161,3 +172,172 @@ def get_candidate_ids_list(data, id_list, user_matrix_sim, num_u, num_i):
         if data[i][-1] in candidate_items:
             cand_ids.append(i)
     return cand_ids
+
+def create_bnb_config(args):
+    return BitsAndBytesConfig(
+        load_in_4bit=args.use_4bit,
+        bnb_4bit_quant_type=args.b4b_qtype,
+        bnb_4bit_compute_dtype=getattr(torch, args.b4b_cdtype),
+        bnb_4bit_use_double_quant=args.nested_quantization,
+    )
+
+def create_peft_config(args):
+    return LoraConfig(
+        lora_alpha=args.lora_a,
+        lora_dropout=args.lora_d,
+        r=args.lora_r,
+        bias='none',
+        task_type='CAUSAL_LM',
+    )
+
+def create_training_arguments(model_name: str, args):
+    os.makedirs(f'../train', exist_ok=True)
+    return TrainingArguments(
+        output_dir=f'../train/{model_name}',
+        num_train_epochs=args.nte,
+        per_device_train_batch_size=args.pdtbs,
+        gradient_accumulation_steps=args.ga_steps,
+        optim=args.optm,
+        save_steps=args.sv_steps,
+        save_total_limit=args.sv_ttl,
+        logging_steps=args.lg_steps,
+        learning_rate=args.lr,
+        weight_decay=args.wd,
+        fp16=args.fp16,
+        bf16=args.bf16,
+        max_grad_norm=args.max_gnorm,
+        max_steps=-1,
+        warmup_ratio=args.wm_ratio,
+        group_by_length=args.group_batches,
+        lr_scheduler_type=args.lr_scheduler,
+        # report_to="wandb" # comment this out if you are not using wandb
+    )
+
+def create_dataset(model_name: str, cand_ids):
+    os.makedirs(f'../results', exist_ok=True)
+    with open(f'../results/{model_name}.pkl', 'rb') as fp:
+        results = pickle.load(fp)
+
+    data = []
+    for i in cand_ids:
+        input_text = results[i]['input_3'].split('### QUESTION:')[0].strip()
+        input_text = input_text + '\n\n### QUESTION: Can you recommend a movie from the "Candidate movie set" similar to the "Five most featured movie"?'
+        input_text = input_text + '\n\n###ANSWER: ' + results[i]['gt'] + ' [end-gen]'
+        data.append((i, results[i]['input_3'], results[i]['gt'], input_text))
+
+    return Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
+
+def train_model_cv(model_name, ds, args):
+    # create fold object
+    skf = StratifiedKFold(n_splits=args.kfold, random_state=args.seed, shuffle=True)
+
+    results = dict()
+    results['namespace'] = args.model
+    results['model_name'] = model_name
+    results['args'] = args
+    for k, (train_idx, test_idx) in enumerate(skf.split(ds['input_text'], ds['ground_truth'])):
+        print(f'Fold {k}, Tran size {len(train_idx)}, Test size {len(test_idx)}')
+        # load base model on GPU
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            quantization_config=create_bnb_config(args),
+            device_map=args.device
+        )
+        # reduce memory usage during fine-tuning
+        model.gradient_checkpointing_enable()
+        # re-enable for inference to speed up predictions for similar inputs
+        model.config.use_cache = False
+        # model.config.pretraining_tp = 1
+
+        # load model tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+
+        # resize model tokens size to match with tokenizer
+        model.resize_token_embeddings(len(tokenizer))
+
+        # prepare model using peft function
+        model = prepare_model_for_kbit_training(model)
+
+        # create trainer object
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=ds.select(train_idx),
+            peft_config=create_peft_config(args),
+            dataset_text_field='input_text',
+            max_seq_length=args.max_seq_len,
+            tokenizer=tokenizer,
+            args=create_training_arguments(model_name, args),
+            packing=args.packing,
+        )
+
+        # MODEL FINE TUNING
+        if args.train_model:
+            train_result = trainer.train()            
+            # save fine tuned model to disk
+            if args.save_tuned:
+                os.makedirs(f"../models", exist_ok=True)
+                trainer.model.save_pretrained(f"../models/ml100k-sample264-{model_name}")
+                # trainer.log_metrics('train', train_result.metrics)
+                trainer.save_metrics('train', train_result.metrics)
+                trainer.save_state()
+                print(f'TRAINING METRICS:\n\t{train_result.metrics}')
+
+        lora_config = LoraConfig.from_pretrained(f"../models/ml100k-sample264-{model_name}")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            quantization_config=create_bnb_config(args),
+            device_map=args.device
+        )
+
+        tuned_model = get_peft_model(model, lora_config)
+        tuned_model.print_trainable_parameters()
+        tuned_model.eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+
+        # resize model embedding
+        tuned_model.resize_token_embeddings(len(tokenizer))
+
+        fold_key = f'{k}_fold'
+        results[fold_key] = dict()  
+        results[fold_key]['start_time'] = time.time()
+        print(f"START TIME: {results[f'{k}_fold']['start_time']}")
+
+        results[fold_key]['results'] = []
+        for idx in test_idx.tolist():
+            sample_result = dict()
+            # results_data[f'{k}_fold'][idx]['id'] = ds[idx]['id']
+            sample_result['input'] = ds[idx]['prompt']
+            sample_result['gt'] = ds[idx]['ground_truth']
+            sample_result['id'] = ds[idx]['id']
+            
+            encoding = tokenizer(ds[idx]['prompt'], return_tensors="pt").to("cuda:0")
+            with torch.inference_mode():
+                outputs = tuned_model.generate(
+                    input_ids=encoding.input_ids, 
+                    attention_mask=encoding.attention_mask,
+                    max_new_tokens=args.mtk, 
+                    eos_token_id=[tokenizer.get_vocab()["[end-gen]"]]
+                )
+                # outputs = tuned_model.generate(**encoding, max_new_tokens=args.mtk, eos_token_id=[tokenizer.get_vocab()["[end-gen]"]])
+            generated = tokenizer.decode(outputs[0], skip_special_tokens=False)
+            #   print(generated)
+            sample_result['output'] = generated.split('[end-gen]')[0]
+            # Check if the ground truth movie is in the final predictions.
+            sample_result['hit'] = sample_result['gt'].lower() in sample_result['output'].lower()
+            print(f'{fold_key}, sample nº {idx}')
+            print(f"\tOUTPUT: {sample_result['output'] }\n")
+            print(f"\tGROUND TRUTH: {sample_result['gt']}\n\n")
+            results[fold_key]['results'].append(sample_result)
+
+        results[fold_key]['end_time'] = time.time()
+        results[fold_key]['total_time'] = results[fold_key]['end_time'] - results[fold_key]['start_time']
+        print(f"END TIME: {results[fold_key]['total_time']}")
+        print(f"Total execution time: {(results[fold_key]['total_time'] / 60):.2f} min")
+
+    return results

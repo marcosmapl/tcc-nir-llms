@@ -1,31 +1,14 @@
 import argparse
-import bitsandbytes as bnb
-import pandas as pd
 import random
-import torch
-import pickle
-import time
 import util
-import numpy as np
-from sklearn.model_selection import StratifiedKFold
+import os
+import pickle
 
-# from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-from datasets import Dataset, DatasetDict
 from huggingface_hub import login
-from transformers.generation.utils import top_k_top_p_filtering
-from trl import SFTTrainer
-
-from peft import (
-    LoraConfig,
-    get_peft_model
-)
-
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TrainingArguments,
-    BitsAndBytesConfig
-)
+# from transformers.generation.utils import top_k_top_p_filtering
+# from trl import SFTTrainer
+# from peft import get_peft_model, prepare_model_for_kbit_training
+# from transformers import AutoModelForCausalLM, AutoTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-model", help="HuggingFace model namespace", type=str, default=None)
@@ -88,176 +71,31 @@ random.seed(args.seed)
 # hugging face loging
 login(token = args.hf)
 
+# gets model simple name from huggingface namespace
+model_name = args.model.split('/')[-1].lower().strip()
+
+# load movie lens 100k dataset
 data_ml_100k = util.read_json("../data/ml_100k.json")
+
 id_list = list(range(0, len(data_ml_100k)))
 assert(len(id_list) == 943)
+
 movie_idx = util.build_index_dict(data_ml_100k)
 user_matrix_sim = util.build_user_similarity_matrix(data_ml_100k, movie_idx)
 pop_dict = util.build_movie_popularity_dict(data_ml_100k)
-item_matrix_sim = util.build_item_similarity_matrix(data_ml_100k)
+item_sim_matrix = util.build_item_similarity_matrix(data_ml_100k)
 
+# create a dataset sample by collaborative filtering
 cand_ids = util.get_candidate_ids_list(data_ml_100k, id_list, user_matrix_sim, args.nsu, args.nci)
 
-# bits and bytes quantization config
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=args.use_4bit,
-    bnb_4bit_quant_type=args.b4b_qtype,
-    bnb_4bit_compute_dtype=getattr(torch, args.b4b_cdtype),
-    bnb_4bit_use_double_quant=args.nested_quantization,
-)
-
-# check if GPU supports bffloat16
-if getattr(torch, args.b4b_cdtype) == torch.float16 and args.use_4bit:
-    major, _ = torch.cuda.get_device_capability()
-    if major >= 8:
-        print("=" * 80)
-        print("Your GPU supports bfloat16: accelerate training with bf16=True")
-        print("=" * 80)
-
-# lora config
-peft_config = LoraConfig(
-    lora_alpha=args.lora_a,
-    lora_dropout=args.lora_d,
-    r=args.lora_r,
-    bias='none',
-    task_type='CAUSAL_LM',
-)
-
-
-model_name = args.model.split('/')[-1].lower().strip()
-skf = StratifiedKFold(n_splits=args.kfold, random_state=args.seed, shuffle=True)
-
 # build training arguments object
-training_arguments = TrainingArguments(
-    output_dir=f'../train/{model_name}',
-    num_train_epochs=args.nte,
-    per_device_train_batch_size=args.pdtbs,
-    gradient_accumulation_steps=args.ga_steps,
-    optim=args.optm,
-    save_steps=args.sv_steps,
-    save_total_limit=args.sv_ttl,
-    logging_steps=args.lg_steps,
-    learning_rate=args.lr,
-    weight_decay=args.wd,
-    fp16=args.fp16,
-    bf16=args.bf16,
-    max_grad_norm=args.max_gnorm,
-    max_steps=-1,
-    warmup_ratio=args.wm_ratio,
-    group_by_length=args.group_batches,
-    lr_scheduler_type=args.lr_scheduler,
-    # report_to="wandb" # comment this out if you are not using wandb
-)
+training_arguments = util.create_training_arguments(model_name, args)
 
-results_filename = f'../results/{model_name}.pkl'
-with open(results_filename, 'rb') as fp:
-    results = pickle.load(fp)
-
-data = []
-for i in cand_ids:
-    input_text = results[i]['input_3'].split('### QUESTION:')[0].strip()
-    input_text = input_text + '\n\n### QUESTION: Can you recommend a movie from the "Candidate movie set" similar to the "Five most featured movie"?'
-    input_text = input_text + '\n\n###ANSWER: ' + results[i]['gt'] + ' [end-gen]'
-    data.append((i, results[i]['input_3'], results[i]['gt'], input_text))
-
-ds = Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
+# load model zero-shot nir prompt results
+ds = util.create_dataset(model_name, cand_ids)
 ds.save_to_disk(f'../datasets/ml100k-sample264-{model_name}')
 
-results = dict()
-results['namespace'] = args.model
-results['model_name'] = model_name
-results['args'] = args
-for k, (train_idx, test_idx) in enumerate(skf.split(ds['input_text'], ds['ground_truth'])):
-    print(f'Fold {k}, Tran size {len(train_idx)}, Test size {len(test_idx)}')
-    # load base model on GPU
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=bnb_config,
-        device_map=args.device
-    )
-    model.config.use_cache = True
-    model.config.pretraining_tp = 1
-
-    # load model tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
-
-    # resize model tokens size to match with tokenizer
-    model.resize_token_embeddings(len(tokenizer))
-
-    # create trainer object
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=ds.select(train_idx),
-        peft_config=peft_config,
-        dataset_text_field='input_text',
-        max_seq_length=args.max_seq_len,
-        tokenizer=tokenizer,
-        args=training_arguments,
-        packing=args.packing,
-    )
-
-    # cast normalization layers.
-    for name, module in trainer.model.named_modules():
-        if "norm" in name:
-            module = module.to(torch.float16)
-
-    # WANDB: 452415af745934fe1163b7f81dee7094e2f268a1
-    # MODEL FINE TUNING
-    if args.train_model:
-        trainer.train()
-
-    # save fine tuned model to disk
-    if args.save_tuned:
-        trainer.model.save_pretrained(f"../models/ml100k-sample264-{model_name}")
-
-    lora_config = LoraConfig.from_pretrained(f"../models/ml100k-sample264-{model_name}")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=bnb_config,
-        device_map=args.device
-    )
-
-    tuned_model = get_peft_model(model, lora_config)
-    tuned_model.print_trainable_parameters()
-    tuned_model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
-
-    # resize model embedding
-    tuned_model.resize_token_embeddings(len(tokenizer))
-
-    fold_key = f'{k}_fold'
-    results[fold_key] = dict()  
-    results[fold_key]['start_time'] = time.time()
-    print(f"START TIME: {results[f'{k}_fold']['start_time']}")
-
-    results[fold_key]['results'] = []
-    for idx in test_idx.tolist():
-        sample_result = dict()
-        # results_data[f'{k}_fold'][idx]['id'] = ds[idx]['id']
-        sample_result['input'] = ds[idx]['prompt']
-        sample_result['gt'] = ds[idx]['ground_truth']
-        sample_result['id'] = ds[idx]['id']
-
-        inputs = tokenizer(ds[idx]['prompt'], return_tensors="pt").to("cuda:0")
-        outputs = tuned_model.generate(**inputs, max_new_tokens=args.mtk, eos_token_id=[tokenizer.get_vocab()["[end-gen]"]])
-        generated = tokenizer.decode(outputs[0], skip_special_tokens=False)
-        #   print(generated)
-        sample_result['output'] = generated.split('[end-gen]')[0]
-        print(f'{fold_key}, sample nº {idx}')
-        print(f"\tOUTPUT: {sample_result['output'] }\n")
-        print(f"\tGROUND TRUTH: {sample_result['gt']}\n\n")
-        results[fold_key]['results'].append(sample_result)
-
-    results[fold_key]['end_time'] = time.time()
-    results[fold_key]['total_time'] = results[fold_key]['end_time'] - results[fold_key]['start_time']
-    print(f"END TIME: {results[fold_key]['total_time']}")
-    print(f"Total execution time: {(results[fold_key]['total_time'] / 60):.2f} min")
-
-with open(f"../results/ml100k-sample264-ft-{model_name}.pkl", 'wb') as fp:
+results = util.train_model_cv(model_name, ds, args)
+os.makedirs(f"../results", exist_ok=True)
+with open(f"../results/ml100k-sample264-ft-cv-{model_name}.pkl", 'wb') as fp:
     pickle.dump(results, fp)
