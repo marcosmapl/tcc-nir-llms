@@ -326,11 +326,10 @@ def train_model_cv(model_name, ds, args):
                     eos_token_id=[tokenizer.get_vocab()["[end-gen]"]]
                 )
                 # outputs = tuned_model.generate(**encoding, max_new_tokens=args.mtk, eos_token_id=[tokenizer.get_vocab()["[end-gen]"]])
-            generated = tokenizer.decode(outputs[0], skip_special_tokens=False)
+            sample_result['output'] = tokenizer.decode(outputs[0], skip_special_tokens=False)
             #   print(generated)
-            sample_result['output'] = generated.split('[end-gen]')[0]
             # Check if the ground truth movie is in the final predictions.
-            sample_result['hit'] = sample_result['ground_truth'].lower() in sample_result['output'].lower()
+            sample_result['hit'] = sample_result['ground_truth'].lower() in sample_result['output'].split('### ANSWER:')[-1].lower()
             print(f'{fold_key}, sample nº {idx}')
             print(f"\tOUTPUT: {sample_result['output'] }\n")
             print(f"\tGROUND TRUTH: {sample_result['ground_truth']}\n\n")
