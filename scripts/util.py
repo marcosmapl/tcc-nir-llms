@@ -213,17 +213,17 @@ def create_training_arguments(model_name: str, args):
         # report_to="wandb" # comment this out if you are not using wandb
     )
 
-def create_dataset(model_name: str, cand_ids):
+def create_dataset(model_name: str, args, cand_ids):
     os.makedirs(f'../results', exist_ok=True)
-    with open(f'../results/{model_name}.pkl', 'rb') as fp:
+    with open(f'../results/ml100k-zs-nir-su{args.nsu}-ci{args.nci}-{model_name}.pkl', 'rb') as fp:
         results = pickle.load(fp)
 
     data = []
     for i in cand_ids:
         input_text = results[i]['input_3'].split('### QUESTION:')[0].strip()
         input_text = input_text + '\n\n### QUESTION: Can you recommend a movie from the "Candidate movie set" similar to the "Five most featured movie"?'
-        input_text = input_text + '\n\n###ANSWER: ' + results[i]['gt'] + ' [end-gen]'
-        data.append((i, results[i]['input_3'], results[i]['gt'], input_text))
+        input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth'] + ' [end-gen]'
+        data.append((i, results[i]['input_3'], results[i]['ground_truth'], input_text))
 
     return Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
 
@@ -235,6 +235,7 @@ def train_model_cv(model_name, ds, args):
     results['namespace'] = args.model
     results['model_name'] = model_name
     results['args'] = args
+    results['results'] = {}
     for k, (train_idx, test_idx) in enumerate(skf.split(ds['input_text'], ds['ground_truth'])):
         print(f'Fold {k}, Tran size {len(train_idx)}, Test size {len(test_idx)}')
         # load base model on GPU
@@ -278,13 +279,13 @@ def train_model_cv(model_name, ds, args):
             # save fine tuned model to disk
             if args.save_tuned:
                 os.makedirs(f"../models", exist_ok=True)
-                trainer.model.save_pretrained(f"../models/ml100k-sample264-{model_name}")
+                trainer.model.save_pretrained(f"../models/ml100k-su{args.nsu}-ci{args.nci}-{model_name}")
                 # trainer.log_metrics('train', train_result.metrics)
                 trainer.save_metrics('train', train_result.metrics)
                 trainer.save_state()
                 print(f'TRAINING METRICS:\n\t{train_result.metrics}')
 
-        lora_config = LoraConfig.from_pretrained(f"../models/ml100k-sample264-{model_name}")
+        lora_config = LoraConfig.from_pretrained(f"../models/ml100k-su{args.nsu}-ci{args.nci}-{model_name}")
 
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
@@ -304,16 +305,16 @@ def train_model_cv(model_name, ds, args):
         tuned_model.resize_token_embeddings(len(tokenizer))
 
         fold_key = f'{k}_fold'
-        results[fold_key] = dict()  
-        results[fold_key]['start_time'] = time.time()
-        print(f"START TIME: {results[f'{k}_fold']['start_time']}")
+        fold_results = dict()
+        fold_results['start_time'] = time.time()
+        fold_results['results'] = []
+        print(f"START TIME: {fold_results['start_time']}")
 
-        results[fold_key]['results'] = []
         for idx in test_idx.tolist():
             sample_result = dict()
             # results_data[f'{k}_fold'][idx]['id'] = ds[idx]['id']
             sample_result['input'] = ds[idx]['prompt']
-            sample_result['gt'] = ds[idx]['ground_truth']
+            sample_result['ground_truth'] = ds[idx]['ground_truth']
             sample_result['id'] = ds[idx]['id']
             
             encoding = tokenizer(ds[idx]['prompt'], return_tensors="pt").to("cuda:0")
@@ -329,15 +330,16 @@ def train_model_cv(model_name, ds, args):
             #   print(generated)
             sample_result['output'] = generated.split('[end-gen]')[0]
             # Check if the ground truth movie is in the final predictions.
-            sample_result['hit'] = sample_result['gt'].lower() in sample_result['output'].lower()
+            sample_result['hit'] = sample_result['ground_truth'].lower() in sample_result['output'].lower()
             print(f'{fold_key}, sample nº {idx}')
             print(f"\tOUTPUT: {sample_result['output'] }\n")
-            print(f"\tGROUND TRUTH: {sample_result['gt']}\n\n")
-            results[fold_key]['results'].append(sample_result)
+            print(f"\tGROUND TRUTH: {sample_result['ground_truth']}\n\n")
+            fold_results['results'].append(sample_result)
 
-        results[fold_key]['end_time'] = time.time()
-        results[fold_key]['total_time'] = results[fold_key]['end_time'] - results[fold_key]['start_time']
-        print(f"END TIME: {results[fold_key]['total_time']}")
-        print(f"Total execution time: {(results[fold_key]['total_time'] / 60):.2f} min")
+        fold_results['end_time'] = time.time()
+        fold_results['total_time'] = fold_results['end_time'] - fold_results['start_time']
+        print(f"END TIME: {fold_results['total_time']}")
+        print(f"Total execution time: {(fold_results['total_time'] / 60):.2f} min")
 
+        results['results'][fold_key] = fold_results 
     return results

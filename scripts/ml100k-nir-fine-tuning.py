@@ -13,8 +13,8 @@ from huggingface_hub import login
 parser = argparse.ArgumentParser()
 parser.add_argument("-model", help="HuggingFace model namespace", type=str, default=None)
 parser.add_argument("-hf", help="HuggingFace auth token", type=str, default=None)
-parser.add_argument("-nsu", help="Number of similar users for filtering", type=int, default=14)
-parser.add_argument("-nci", help="Number of candidate items for recommendation", type=int, default=38)
+parser.add_argument("-nsu", help="Number of similar users for filtering", type=int, default=12)
+parser.add_argument("-nci", help="Number of candidate items for recommendation", type=int, default=19)
 parser.add_argument("-kfold", help="Cross validation K-Fold splits", type=int, default=4)
 parser.add_argument("-seed", help="random seed", type=int, default=0)
 parser.add_argument("-lora-r", help="the LoRA attention dimension, specifies the rank of the update matrices.", type=int, default=64)
@@ -92,10 +92,10 @@ cand_ids = util.get_candidate_ids_list(data_ml_100k, id_list, user_matrix_sim, a
 training_arguments = util.create_training_arguments(model_name, args)
 
 # load model zero-shot nir prompt results
-ds = util.create_dataset(model_name, cand_ids)
-ds.save_to_disk(f'../datasets/ml100k-sample264-{model_name}')
+ds = util.create_dataset(model_name, args, cand_ids)
+# ds.save_to_disk(f'../datasets/ml100k-sample264-{model_name}')
 
 results = util.train_model_cv(model_name, ds, args)
 os.makedirs(f"../results", exist_ok=True)
-with open(f"../results/ml100k-sample264-ft-cv-{model_name}.pkl", 'wb') as fp:
+with open(f"../results/ml100k-ft-cv-su{args.nsu}-ci{args.nci}-{model_name}.pkl", 'wb') as fp:
     pickle.dump(results, fp)
