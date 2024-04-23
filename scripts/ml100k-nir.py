@@ -7,7 +7,7 @@ import torch
 import pickle
 import util
 
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import login
 
 # Setup the argument parser with descriptions for each option.
@@ -40,6 +40,7 @@ parser.add_argument('-penality', help="Penalty for repetition in generation", ty
 parser.add_argument('-maxtokens', help="Maximum new tokens to generate", type=int, default=1024)
 parser.add_argument('-topp', help="Top-p sampling probability", type=float, default=1.0)
 parser.add_argument('-topk', help="Top-k sampling limit", type=int, default=50)
+parser.add_argument('-loglevel', type=int, default=0)
 args = parser.parse_args()
 
 # Set the random seed for reproducibility.
@@ -76,6 +77,11 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 # Load the model tokenizer.
 tokenizer = AutoTokenizer.from_pretrained(args.model)
+tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+
+# resize model tokens size to match with tokenizer
+# model.resize_token_embeddings(len(tokenizer))
 
 # Create a pipeline for text generation with the loaded model and tokenizer.
 pipe = transformers.pipeline(
@@ -88,61 +94,66 @@ pipe = transformers.pipeline(
     repetition_penalty=args.penality,
     max_new_tokens=args.maxtokens,
     top_p=args.topp,
-    top_k=args.topk
+    top_k=args.topk,
+    # eos_token_id=tokenizer.eos_token_id,
 )
 
 # Process each user in the dataset and generate recommendations.
 results = {'args': vars(args), 'start_time': time.time()}
 results['namespace'] = args.model
 results['model_name'] = model_name
-results 
-print(f"START TIME: {results['start_time']}")
+
+util.log(f"** START TIME: {results['start_time']}\n", util.LOG_LEVEL_INFO, args)
 
 for i in id_list:
-    print(f'SAMPLE: {i} of {len(id_list)} ...')
+    util.log(f'** SAMPLE: {i} of {len(id_list)}\n', util.LOG_LEVEL_INFO, args)
     results[i] = {}
 
     watched_mv = data_ml_100k[i][0].split(' | ')[::-1]
     results[i]['ground_truth'] = data_ml_100k[i][-1]
+    util.log(f"** GROUND TRUTH: {results[i]['ground_truth']}\n", util.LOG_LEVEL_DEBUG, args)
 
     # Generate candidate items based on user filtering.
     candidate_items = util.sort_user_filtering_items(data_ml_100k, watched_mv, user_sim_matrix[i], args.nsu, args.nci)
     random.shuffle(candidate_items)
     results[i]['candidate_set'] = candidate_items
-    print('\tCANDIDATE MOVIE SET: ', candidate_items)
+    util.log(f'** CANDIDATE MOVIE SET: {candidate_items}\n', util.LOG_LEVEL_DEBUG, args)
 
     # Process inputs through the pipeline in steps and record predictions.
     # STEP 01
     input_1 = util.PROMPT_TEMPLATE1.format(', '.join(watched_mv[-args.lenlimit:]))
+    util.log(f'** INPUT 1: {input_1}\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['input_1'] = input_1
     response = pipe(input_1)[0]['generated_text'].strip()
     predictions_1 = response[len(input_1):].strip()
+    util.log(f'** PREDICTIONS 1: {predictions_1}\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['predictions_1'] = predictions_1
-    print('Output 1\n\t', predictions_1)
 
     # STEP 02
     input_2 = util.PROMPT_TEMPLATE2.format(', '.join(watched_mv[-args.lenlimit:]), predictions_1)
+    util.log(f'** INPUT 2: {input_2}\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['input_2'] = input_2
     response = pipe(input_2)[0]['generated_text'].strip()
     predictions_2 = response[len(input_2):].strip()
+    util.log(f'** PREDICTIONS 2: {predictions_2}\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['predictions_2'] = predictions_2
-    print('\nOutput 2\n\t', predictions_2)
 
     # STEP 03
     input_3 = util.PROMPT_TEMPLATE3.format(', '.join(candidate_items), ', '.join(watched_mv[-args.lenlimit:]), predictions_1, predictions_2)
+    util.log(f'** INPUT 3: {input_3}\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['input_3'] = input_3
     response = pipe(input_3)[0]['generated_text'].strip()
     predictions_3 = response[len(input_3):].strip()
+    util.log(f'** PREDICTIONS 3: {predictions_3}\n\n', util.LOG_LEVEL_DEBUG, args)
     results[i]['predictions_3'] = predictions_3
-    print('\nOutput 3\n\t', predictions_3, '\n\n')
     
      # Check if the ground truth movie is in the final predictions.
     results[i]['hit'] = data_ml_100k[i][-1].lower() in predictions_3.lower()
 
 results['end_time'] = time.time()
 results['total_time'] = results['end_time'] - results['start_time']
-print(f"END TIME: {results['end_time']}")
-print(f"Total execution time: {results['total_time'] / 60:.2f} min")
+util.log(f"** END TIME: {results['end_time']}\n", util.LOG_LEVEL_INFO, args)
+util.log(f"** TOTAL EXECUTION TIME: {results['total_time'] / 60:.2f} min\n", util.LOG_LEVEL_INFO, args)
 
 # save dictionary to pickle file
 with open(f'../results/ml100k-zs-nir-su{args.nsu}-ci{args.nci}-{model_name}.pkl', 'wb') as file:

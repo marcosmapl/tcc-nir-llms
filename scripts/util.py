@@ -9,8 +9,15 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from sklearn.model_selection import StratifiedKFold
+# from transformers.generation.utils import top_k_top_p_filtering
 from transformers import BitsAndBytesConfig, TrainingArguments, AutoModelForCausalLM, AutoTokenizer, Trainer
 from trl import SFTTrainer
+
+LOG_LEVEL_ALL = 0
+LOG_LEVEL_DEBUG = 1
+LOG_LEVEL_INFO = 2
+LOG_LEVEL_WARN = 3
+LOG_LEVEL_ERROR = 4
 
 PROMPT_TEMPLATE1 = """You are a movie expert provide the answer for the question based on the given context. If you don't know the answer to a question, please don't share false information.
 
@@ -18,7 +25,8 @@ PROMPT_TEMPLATE1 = """You are a movie expert provide the answer for the question
 
 ### QUESTION: Based on my watched movies list. Tell me what features are most important to me when selecting movies (Summarize my preferences briefly)?
 
-### ANSWER:"""
+### ANSWER:
+"""
 
 PROMPT_TEMPLATE2 = """You are a movie expert provide the answer for the question based on the given context. If you don't know the answer to a question, please don't share false information.
 
@@ -28,7 +36,8 @@ PROMPT_TEMPLATE2 = """You are a movie expert provide the answer for the question
 
 ### QUESTION: Create an enumerated list selecting the five most featured movies from the watched movies according to my movie preferences.
 
-### ANSWER:"""
+### ANSWER:
+"""
 
 PROMPT_TEMPLATE3 = """You are a movie expert provide the answer for the question based on the given context. If you don't know the answer to a question, please don't share false information.
 
@@ -40,12 +49,18 @@ PROMPT_TEMPLATE3 = """You are a movie expert provide the answer for the question
 
 ### MY FIVE MOST FEATURED MOVIES: {}.
 
-### QUESTION: Can you recommend 10 movies from the "Candidate movie set" similar to the "Five most featured movies" I've watched?. Use format "Recommended movie" # "Similar movie".
+### QUESTION: Can you recommend 10 movies from the "Candidate movie set" similar to the "Five most featured movies" I've watched (use format "Recommended movie" # "Similar movie")?
 
-### ANSWER:"""
+### ANSWER:
+"""
 
 # Default encoding
 DEFAULT_ENCODING = 'utf-8'
+
+
+def log(msg, level, args):
+    if level >= args.loglevel:
+        print(msg)
 
 def read_json(path: str):
     with open(path) as f:
@@ -223,6 +238,7 @@ def create_dataset(model_name: str, args, cand_ids):
         input_text = results[i]['input_3'].split('### QUESTION:')[0].strip()
         input_text = input_text + '\n\n### QUESTION: Can you recommend a movie from the "Candidate movie set" similar to the "Five most featured movie"?'
         input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth'] + ' [end-gen]'
+        # input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth']
         data.append((i, results[i]['input_3'], results[i]['ground_truth'], input_text))
 
     return Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
@@ -234,10 +250,12 @@ def train_model_cv(model_name, ds, args):
     results = dict()
     results['namespace'] = args.model
     results['model_name'] = model_name
+    log(f'** TRAINING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
     results['args'] = args
     results['results'] = {}
+    results['start_time'] = time.time()
     for k, (train_idx, test_idx) in enumerate(skf.split(ds['input_text'], ds['ground_truth'])):
-        print(f'Fold {k}, Tran size {len(train_idx)}, Test size {len(test_idx)}')
+        log(f'** FOLD {k} | TRAIN SIZE {len(train_idx)} | TEST SIZE {len(test_idx)}\n', LOG_LEVEL_INFO, args)
         # load base model on GPU
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
@@ -278,13 +296,15 @@ def train_model_cv(model_name, ds, args):
             train_result = trainer.train()            
             # save fine tuned model to disk
             if args.save_tuned:
+                log(f'** SAVING MODEL RESULTS\n', LOG_LEVEL_INFO, args)
                 os.makedirs(f"../models", exist_ok=True)
                 trainer.model.save_pretrained(f"../models/ml100k-su{args.nsu}-ci{args.nci}-{model_name}")
                 # trainer.log_metrics('train', train_result.metrics)
                 trainer.save_metrics('train', train_result.metrics)
                 trainer.save_state()
-                print(f'TRAINING METRICS:\n\t{train_result.metrics}')
+                log(f'** TRAINING METRICS:\n{train_result.metrics}\n', LOG_LEVEL_DEBUG, args)
 
+        log(f'** TESTING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
         lora_config = LoraConfig.from_pretrained(f"../models/ml100k-su{args.nsu}-ci{args.nci}-{model_name}")
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -308,14 +328,14 @@ def train_model_cv(model_name, ds, args):
         fold_results = dict()
         fold_results['start_time'] = time.time()
         fold_results['results'] = []
-        print(f"START TIME: {fold_results['start_time']}")
+        log(f"** FOLD: {fold_key} | START TIME: {fold_results['start_time']}", LOG_LEVEL_INFO, args)
 
         for idx in test_idx.tolist():
             sample_result = dict()
-            # results_data[f'{k}_fold'][idx]['id'] = ds[idx]['id']
+            sample_result['id'] = ds[idx]['id']
             sample_result['input'] = ds[idx]['prompt']
             sample_result['ground_truth'] = ds[idx]['ground_truth']
-            sample_result['id'] = ds[idx]['id']
+            log(f"** SAMPLE ID: {sample_result['id']}\n", LOG_LEVEL_DEBUG, args)
             
             encoding = tokenizer(ds[idx]['prompt'], return_tensors="pt").to("cuda:0")
             with torch.inference_mode():
@@ -330,15 +350,16 @@ def train_model_cv(model_name, ds, args):
             #   print(generated)
             # Check if the ground truth movie is in the final predictions.
             sample_result['hit'] = sample_result['ground_truth'].lower() in sample_result['output'].split('### ANSWER:')[-1].lower()
-            print(f'{fold_key}, sample nº {idx}')
-            print(f"\tOUTPUT: {sample_result['output'] }\n")
-            print(f"\tGROUND TRUTH: {sample_result['ground_truth']}\n\n")
+            log(f"** OUTPUT: {sample_result['output'] }\n", LOG_LEVEL_DEBUG, args)
+            log(f"** GROUND TRUTH: {sample_result['ground_truth']}\n", LOG_LEVEL_DEBUG, args)
             fold_results['results'].append(sample_result)
 
         fold_results['end_time'] = time.time()
         fold_results['total_time'] = fold_results['end_time'] - fold_results['start_time']
-        print(f"END TIME: {fold_results['total_time']}")
-        print(f"Total execution time: {(fold_results['total_time'] / 60):.2f} min")
-
+        log(f"** FOLD: {fold_key} | DURATION: {(fold_results['total_time'] / 60):.2f} min\n", LOG_LEVEL_DEBUG, args)
         results['results'][fold_key] = fold_results 
+
+    results['end_time'] = time.time()
+    results['total_time'] = results['end_time'] - results['start_time']  
+    log(f"** TOTAL EXECUTION TIME: {(results['total_time'] / 60):.2f} min\n", LOG_LEVEL_DEBUG, args)
     return results
