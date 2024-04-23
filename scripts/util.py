@@ -237,8 +237,8 @@ def create_dataset(model_name: str, args, cand_ids):
     for i in cand_ids:
         input_text = results[i]['input_3'].split('### QUESTION:')[0].strip()
         input_text = input_text + '\n\n### QUESTION: Can you recommend a movie from the "Candidate movie set" similar to the "Five most featured movie"?'
-        input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth'] + ' [end-gen]'
-        # input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth']
+        # input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth'] + ' \n[end-gen]'
+        input_text = input_text + '\n\n###ANSWER: ' + results[i]['ground_truth']
         data.append((i, results[i]['input_3'], results[i]['ground_truth'], input_text))
 
     return Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
@@ -271,10 +271,10 @@ def train_model_cv(model_name, ds, args):
         # load model tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
         tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+        # tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
 
         # resize model tokens size to match with tokenizer
-        model.resize_token_embeddings(len(tokenizer))
+        # model.resize_token_embeddings(len(tokenizer))
 
         # prepare model using peft function
         model = prepare_model_for_kbit_training(model)
@@ -319,10 +319,10 @@ def train_model_cv(model_name, ds, args):
 
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
         tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+        # tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
 
         # resize model embedding
-        tuned_model.resize_token_embeddings(len(tokenizer))
+        # tuned_model.resize_token_embeddings(len(tokenizer))
 
         fold_key = f'{k}_fold'
         fold_results = dict()
@@ -337,13 +337,21 @@ def train_model_cv(model_name, ds, args):
             sample_result['ground_truth'] = ds[idx]['ground_truth']
             log(f"** SAMPLE ID: {sample_result['id']}\n", LOG_LEVEL_DEBUG, args)
             
-            encoding = tokenizer(ds[idx]['prompt'], return_tensors="pt").to("cuda:0")
+            encoding = tokenizer(ds[idx]['prompt'], return_tensors="pt").to(tuned_model.device)
+            gen_config = tuned_model.generation_config
+            gen_config.temperature = args.temperature
+            gen_config.penality = args.penality
+            gen_config.max_new_tokens = args.maxtokens
+            gen_config.top_p = args.topp
+            gen_config.top_k = args.topk
+            gen_config.num_return_sequences = 1
+            gen_config.pad_token_id = tokenizer.eos_token_id
+            gen_config.eos_token_id = tokenizer.eos_token_id
             with torch.inference_mode():
                 outputs = tuned_model.generate(
                     input_ids=encoding.input_ids, 
                     attention_mask=encoding.attention_mask,
-                    max_new_tokens=args.mtk, 
-                    eos_token_id=[tokenizer.get_vocab()["[end-gen]"]]
+                    generation_config=gen_config
                 )
                 # outputs = tuned_model.generate(**encoding, max_new_tokens=args.mtk, eos_token_id=[tokenizer.get_vocab()["[end-gen]"]])
             sample_result['output'] = tokenizer.decode(outputs[0], skip_special_tokens=False)
