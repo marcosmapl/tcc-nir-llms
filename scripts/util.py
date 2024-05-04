@@ -243,6 +243,120 @@ def create_dataset(model_name: str, args, cand_ids):
 
     return Dataset.from_pandas(pd.DataFrame(data, columns=['id', 'prompt', 'ground_truth', 'input_text']))
 
+
+def train_model(model_name, ds, args, test_size=.2):
+    test_str = str(int(test_size*100))
+    results = dict()
+    results['namespace'] = args.model
+    results['model_name'] = model_name
+    log(f'** TRAINING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
+    results['args'] = args
+    results['results'] = []
+    results['start_time'] = time.time()
+
+    ds_splited = ds.train_test_split(test_size=test_size)
+
+    log(f'** TRAINING MODEL SIZE | TEST SIZE {test_size}\n', LOG_LEVEL_INFO, args)
+    # load base model on GPU
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        quantization_config=create_bnb_config(args),
+        device_map=args.device
+    )
+    # reduce memory usage during fine-tuning
+    model.gradient_checkpointing_enable()
+    # re-enable for inference to speed up predictions for similar inputs
+    model.config.use_cache = False
+    # model.config.pretraining_tp = 1
+
+    # load model tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
+
+    # resize model tokens size to match with tokenizer
+    # model.resize_token_embeddings(len(tokenizer))
+
+    # prepare model using peft function
+    model = prepare_model_for_kbit_training(model)
+
+    # create trainer object
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=ds_splited['train'],
+        peft_config=create_peft_config(args),
+        dataset_text_field='input_text',
+        max_seq_length=args.max_seq_len,
+        tokenizer=tokenizer,
+        args=create_training_arguments(model_name, args),
+        packing=args.packing,
+    )
+
+    train_result = trainer.train()            
+    # save fine tuned model to disk
+    if args.save_tuned:
+        log(f'** SAVING MODEL RESULTS\n', LOG_LEVEL_INFO, args)
+        os.makedirs(f"../models", exist_ok=True)
+        trainer.model.save_pretrained(f"../models/ml100k_su{args.nsu}_ci{args.nci}_test{test_str}_{model_name}")
+        # trainer.log_metrics('train', train_result.metrics)
+        trainer.save_metrics('train', train_result.metrics)
+        trainer.save_state()
+        log(f'** TRAINING METRICS:\n{train_result.metrics}\n', LOG_LEVEL_DEBUG, args)
+    
+    log(f'** TESTING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
+    lora_config = LoraConfig.from_pretrained(f"../models/ml100k_su{args.nsu}_ci{args.nci}_test{test_str}_{model_name}")
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        quantization_config=create_bnb_config(args),
+        device_map=args.device
+    )
+
+    tuned_model = get_peft_model(model, lora_config)
+    tuned_model.print_trainable_parameters()
+    tuned_model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
+    for test_sample in ds_splited['test']:
+        sample_result = dict()
+        sample_result['id'] = test_sample['id']
+        sample_result['input'] = test_sample['prompt']
+        sample_result['ground_truth'] = test_sample['ground_truth']
+        log(f"** SAMPLE ID: {sample_result['id']}\n", LOG_LEVEL_DEBUG, args)
+        
+        encoding = tokenizer(test_sample['prompt'], return_tensors="pt").to(tuned_model.device)
+        gen_config = tuned_model.generation_config
+        gen_config.temperature = args.temperature
+        gen_config.penality = args.penality
+        gen_config.max_new_tokens = args.maxtokens
+        gen_config.top_p = args.topp
+        gen_config.top_k = args.topk
+        gen_config.num_return_sequences = 1
+        gen_config.pad_token_id = tokenizer.eos_token_id
+        gen_config.eos_token_id = tokenizer.eos_token_id
+        with torch.inference_mode():
+            outputs = tuned_model.generate(
+                input_ids=encoding.input_ids, 
+                attention_mask=encoding.attention_mask,
+                generation_config=gen_config
+            )
+            # outputs = tuned_model.generate(**encoding, max_new_tokens=args.mtk, eos_token_id=[tokenizer.get_vocab()["[end-gen]"]])
+        sample_result['output'] = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        #   print(generated)
+        # Check if the ground truth movie is in the final predictions.
+        sample_result['hit'] = sample_result['ground_truth'].lower() in sample_result['output'].split('### ANSWER:')[-1].lower()
+        log(f"** OUTPUT: {sample_result['output'] }\n", LOG_LEVEL_DEBUG, args)
+        log(f"** GROUND TRUTH: {sample_result['ground_truth']}\n", LOG_LEVEL_DEBUG, args)
+        results['results'].append(sample_result)
+
+    results['end_time'] = time.time()
+    results['total_time'] = results['end_time'] - results['start_time']
+    log(f"** TOTAL DURATION: {(results['total_time'] / 60):.2f} min\n", LOG_LEVEL_DEBUG, args)
+    return
+
+
 def train_model_cv(model_name, ds, args):
     # create fold object
     skf = StratifiedKFold(n_splits=args.kfold, random_state=args.seed, shuffle=True)
