@@ -255,6 +255,7 @@ def train_model(model_name, ds, args, test_size=.2):
     results['start_time'] = time.time()
 
     ds_splited = ds.train_test_split(test_size=test_size)
+    print(f'** DATASET: {ds_splited}')
 
     log(f'** TRAINING MODEL SIZE | TEST SIZE {test_size}\n', LOG_LEVEL_INFO, args)
     # load base model on GPU
@@ -354,7 +355,7 @@ def train_model(model_name, ds, args, test_size=.2):
     results['end_time'] = time.time()
     results['total_time'] = results['end_time'] - results['start_time']
     log(f"** TOTAL DURATION: {(results['total_time'] / 60):.2f} min\n", LOG_LEVEL_DEBUG, args)
-    return
+    return results
 
 
 def train_model_cv(model_name, ds, args):
