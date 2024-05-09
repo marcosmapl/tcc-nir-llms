@@ -102,5 +102,5 @@ ds = util.create_dataset(model_name, args, cand_ids)
 
 results = util.train_model(model_name, ds, args)
 os.makedirs(f"../results", exist_ok=True)
-with open(f"../results/ml100k_ft_su{args.nsu}_ci{args.nci}_test80_{model_name}.pkl", 'wb') as fp:
+with open(f"../results/ml100k_ft_su{args.nsu}_ci{args.nci}_test20_{model_name}.pkl", 'wb') as fp:
     pickle.dump(results, fp)
