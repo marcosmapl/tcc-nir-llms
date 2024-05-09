@@ -5,10 +5,6 @@ import os
 import pickle
 
 from huggingface_hub import login
-# from transformers.generation.utils import top_k_top_p_filtering
-# from trl import SFTTrainer
-# from peft import get_peft_model, prepare_model_for_kbit_training
-# from transformers import AutoModelForCausalLM, AutoTokenizer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-model", help="HuggingFace model namespace", type=str, default=None)
@@ -31,7 +27,7 @@ parser.set_defaults(nested_quantization=True)
 parser.add_argument("-lg-steps", help="Determines the frequency of logging, i.e., log every N steps.", type=int, default=10)
 parser.add_argument("-sv-steps", help="Determines the frequency of saving the model, i.e., save model checkpoint every N steps.", type=int, default=20)
 parser.add_argument("-sv_ttl", help="Limits the total amount of checkpoints and deletes older checkpoints.", type=int, default=2)
-parser.add_argument("-nte", help="Specifies the number of training epochs.", type=int, default=1)
+parser.add_argument("-nte", help="Specifies the number of training epochs.", type=int, default=3)
 parser.add_argument('--fp16', dest='fp16', action='store_true')
 parser.add_argument('--no-fp16', dest='fp16', action='store_false')
 parser.set_defaults(fp16=True)
@@ -101,6 +97,6 @@ ds = util.create_dataset(model_name, args, cand_ids)
 # ds.save_to_disk(f'../datasets/ml100k-sample264-{model_name}')
 
 results = util.train_model(model_name, ds, args)
-os.makedirs(f"../results", exist_ok=True)
+# os.makedirs(f"../results", exist_ok=True)
 with open(f"../results/ml100k_ft_su{args.nsu}_ci{args.nci}_test20_{model_name}.pkl", 'wb') as fp:
     pickle.dump(results, fp)

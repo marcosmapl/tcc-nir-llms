@@ -245,11 +245,11 @@ def create_dataset(model_name: str, args, cand_ids):
 
 
 def train_model(model_name, ds, args, test_size=.2):
+    log(f'** TRAINING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
     test_str = str(int(test_size*100))
     results = dict()
     results['namespace'] = args.model
     results['model_name'] = model_name
-    log(f'** TRAINING MODEL: {model_name}\n', LOG_LEVEL_INFO, args)
     results['args'] = args
     results['results'] = []
     results['start_time'] = time.time()
@@ -273,10 +273,6 @@ def train_model(model_name, ds, args, test_size=.2):
     # load model tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer.add_special_tokens({"additional_special_tokens" : ['[end-gen]']})
-
-    # resize model tokens size to match with tokenizer
-    # model.resize_token_embeddings(len(tokenizer))
 
     # prepare model using peft function
     model = prepare_model_for_kbit_training(model)
@@ -300,7 +296,7 @@ def train_model(model_name, ds, args, test_size=.2):
         os.makedirs(f"../models", exist_ok=True)
         trainer.model.save_pretrained(f"../models/ml100k_su{args.nsu}_ci{args.nci}_test{test_str}_{model_name}")
         # trainer.log_metrics('train', train_result.metrics)
-        trainer.save_metrics('train', train_result.metrics)
+        # trainer.save_metrics('train', train_result.metrics)
         trainer.save_state()
         log(f'** TRAINING METRICS:\n{train_result.metrics}\n', LOG_LEVEL_DEBUG, args)
     
@@ -355,6 +351,7 @@ def train_model(model_name, ds, args, test_size=.2):
     results['end_time'] = time.time()
     results['total_time'] = results['end_time'] - results['start_time']
     log(f"** TOTAL DURATION: {(results['total_time'] / 60):.2f} min\n", LOG_LEVEL_DEBUG, args)
+    
     return results
 
 
